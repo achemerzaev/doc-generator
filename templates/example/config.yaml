@@ -1,0 +1,69 @@
+id: example_access_request
+title: Пример_заявки_на_доступ
+file: test.docx
+
+fields:
+  employee_full_name:
+    label: ФИО сотрудника
+    required: true
+    type: catalog_select
+
+  department:
+    label: Подразделение
+    required: true
+    type: text
+
+  employee_job_role:
+    label: Должность сотрудника
+    required: true
+    type: text
+
+  emp_phone:
+    label: Рабочий телефон сотрудника
+    required: true
+    type: text
+
+  information_system:
+    label: Информационная система
+    required: true
+    type: text
+
+  access_level:
+    label: Уровень доступа
+    required: true
+    type: text
+
+  business_reason:
+    label: Служебная необходимость
+    required: true
+    type: text
+
+  begin_date:
+    label: Дата начала доступа
+    required: true
+    type: date
+
+  end_date:
+    label: Дата окончания доступа
+    required: true
+    type: date
+
+  additional_notes:
+    label: Дополнительные примечания
+    required: false
+    type: text
+
+  supervisor_full_name:
+    label: ФИО руководителя
+    required: true
+    type: text
+
+  supervisor_job_role:
+    label: Должность руководителя
+    required: true
+    type: text
+
+  sup_phone:
+    label: Рабочий телефон руководителя
+    required: true
+    type: text

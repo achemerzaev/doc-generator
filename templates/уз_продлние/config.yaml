@@ -1,0 +1,52 @@
+id: uz_extension
+title: Продление_УЗ
+file: УЗ_продление_шаблон.docx
+
+output_name: "{title}_{employee_full_name}_{current_date}.docx"
+
+fields:
+  employee_full_name:
+    label: ФИО подключаемого пользователя
+    required: true
+    type: catalog_select
+
+  department:
+    label: Название отдела / заказчик работ
+    required: true
+    type: text
+
+  employee_job_role:
+    label: Должность подключаемого пользователя
+    required: true
+    type: text
+
+  emp_phone:
+    label: Телефон подключаемого пользователя (xx-xx)
+    required: true
+    type: text
+
+  order_num:
+    label: Номер приказа (3 цифры)
+    required: true
+    type: text
+
+  order_date:
+    label: Дата приказа
+    required: true
+    type: date
+
+  begin_date:
+    label: Начальная дата
+    required: true
+    type: date
+
+  end_date:
+    label: Конечная дата
+    required: true
+    type: date
+  
+  supervisor_name:
+    label: Фамилия И.О руководителя
+    required: true
+    type: text
+
