@@ -1,13 +1,18 @@
 from datetime import date
 from pathlib import Path
+import re
+import shutil
 import sys
 import traceback
+import zipfile
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 import openpyxl
 import yaml
+from docx import Document
 from docxtpl import DocxTemplate
 
 from widgets import (
@@ -75,6 +80,8 @@ def load_templates(template_dirs):
                 )
 
             config["file"] = template_path
+            config["id"] = template_id
+            config["config_path"] = config_path
             templates[template_id] = config
 
     return templates
@@ -297,6 +304,486 @@ def change_template(
             entries,
         )
 
+
+PLACEHOLDER_PATTERN = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
+WORD_PART_PATTERN = re.compile(
+    r"word/(?:document|header\d*|footer\d*)\.xml\Z"
+)
+IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+DATE_FIELD_PATTERN = re.compile(r"(?:^|_)date\Z")
+WORD_PARAGRAPH_TAG = (
+    "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+)
+WORD_TEXT_TAG = (
+    "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+)
+
+
+def extract_placeholder_name(expression):
+    name = expression.split("|", 1)[0].split(".", 1)[0].strip()
+
+    if not IDENTIFIER_PATTERN.match(name):
+        return None
+
+    if name in {"true", "false", "none", "True", "False", "None"}:
+        return None
+
+    return name
+
+
+def extract_placeholders(template_path):
+    """Return Jinja placeholder names in document order."""
+
+    placeholders = []
+
+    with zipfile.ZipFile(template_path) as archive:
+        part_names = [
+            name
+            for name in archive.namelist()
+            if WORD_PART_PATTERN.match(name)
+        ]
+
+        for part_name in part_names:
+            try:
+                root = ET.fromstring(archive.read(part_name))
+            except ET.ParseError:
+                continue
+
+            for paragraph in root.iter(WORD_PARAGRAPH_TAG):
+                text = "".join(
+                    node.text or "" for node in paragraph.iter(WORD_TEXT_TAG)
+                )
+
+                for match in PLACEHOLDER_PATTERN.finditer(text):
+                    name = extract_placeholder_name(match.group(1))
+
+                    if name and name not in placeholders:
+                        placeholders.append(name)
+
+    return placeholders
+
+
+def save_template_config(config):
+    """Persist a template configuration back to its config.yaml."""
+
+    config_path = config["config_path"]
+    data = {
+        "id": config["id"],
+        "title": config["title"],
+        "file": Path(config["file"]).name,
+    }
+
+    for key, value in config.items():
+        if key in ("id", "title", "file", "config_path"):
+            continue
+        data[key] = value
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with config_path.open("w", encoding="UTF-8") as file:
+        yaml.safe_dump(data, file, allow_unicode=True, sort_keys=False)
+
+
+def make_unique_template_dir(base_name):
+    templates_root = APP_DIR / "templates"
+    templates_root.mkdir(parents=True, exist_ok=True)
+
+    slug = re.sub(r"[^0-9A-Za-z_]+", "_", base_name).strip("_").lower()
+
+    if not slug:
+        slug = "template"
+
+    used_names = set(TEMPLATES) | {
+        entry.name for entry in templates_root.iterdir()
+    }
+
+    candidate = slug
+    counter = 1
+
+    while candidate in used_names or (templates_root / candidate).exists():
+        counter += 1
+        candidate = f"{slug}_{counter}"
+
+    template_dir = templates_root / candidate
+    template_dir.mkdir(parents=True, exist_ok=True)
+    return template_dir
+
+
+def create_default_template():
+    """Create a starter template when none are available."""
+
+    template_dir = make_unique_template_dir("default")
+    template_file = template_dir / "default.docx"
+    config_path = template_dir / "config.yaml"
+
+    document = Document()
+    document.add_paragraph("Заявка на доступ")
+    document.add_paragraph("Сотрудник: {{ employee_full_name }}")
+    document.add_paragraph("Дата начала: {{ begin_date }}")
+    document.add_paragraph("Дата окончания: {{ end_date }}")
+    document.save(template_file)
+
+    config = {
+        "id": template_dir.name,
+        "title": "Базовый шаблон",
+        "file": template_file.name,
+        "fields": {
+            "employee_full_name": {
+                "label": "ФИО сотрудника",
+                "required": False,
+                "type": "catalog_select",
+            },
+            "begin_date": {
+                "label": "Дата начала",
+                "required": False,
+                "type": "date",
+            },
+            "end_date": {
+                "label": "Дата окончания",
+                "required": False,
+                "type": "date",
+            },
+        },
+        "config_path": config_path,
+    }
+    save_template_config(config)
+
+    return config
+
+
+def load_templates_with_fallback(template_dirs):
+    """Load templates, creating a starter one when none exist."""
+
+    templates = load_templates(template_dirs)
+
+    if templates:
+        return templates
+
+    try:
+        create_default_template()
+    except Exception:
+        pass
+
+    return load_templates(template_dirs)
+
+
+def ask_template_labels(root, title, fields):
+    """Ask for a template title and a label per placeholder.
+
+    ``fields`` maps a placeholder name to its current label.
+    Returns ``(title, {placeholder: label})`` or ``None`` when cancelled.
+    """
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Подписи шаблона")
+    dialog.transient(root)
+    dialog.resizable(False, False)
+
+    result = {}
+
+    body = tk.Frame(dialog)
+    body.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+    canvas = tk.Canvas(body, highlightthickness=0, width=430)
+    scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+    content = tk.Frame(canvas)
+
+    content.bind(
+        "<Configure>",
+        lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
+    )
+    canvas.create_window((0, 0), window=content, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    content.columnconfigure(1, weight=1)
+
+    tk.Label(content, text="Название шаблона:").grid(
+        row=0,
+        column=0,
+        padx=(0, 8),
+        pady=4,
+        sticky="w",
+    )
+    title_entry = tk.Entry(content, width=42)
+    title_entry.insert(0, title)
+    title_entry.grid(row=0, column=1, pady=4, sticky="ew")
+
+    label_entries = {}
+
+    for row, (field_name, current_label) in enumerate(
+        fields.items(),
+        start=1,
+    ):
+        tk.Label(content, text=field_name).grid(
+            row=row,
+            column=0,
+            padx=(0, 8),
+            pady=4,
+            sticky="w",
+        )
+        entry = tk.Entry(content, width=42)
+        entry.insert(0, current_label)
+        entry.grid(row=row, column=1, pady=4, sticky="ew")
+        label_entries[field_name] = entry
+
+    buttons = tk.Frame(dialog)
+    buttons.pack(fill="x", padx=10, pady=10)
+
+    def on_save():
+        new_title = title_entry.get().strip()
+
+        if not new_title:
+            messagebox.showerror(
+                "Ошибка",
+                "Название шаблона не может быть пустым",
+                parent=dialog,
+            )
+            return
+
+        result["value"] = (
+            new_title,
+            {
+                field_name: entry.get().strip() or field_name
+                for field_name, entry in label_entries.items()
+            },
+        )
+        dialog.destroy()
+
+    tk.Button(buttons, text="Сохранить", command=on_save).pack(
+        side="right",
+        padx=(8, 0),
+    )
+    tk.Button(buttons, text="Отмена", command=dialog.destroy).pack(
+        side="right",
+    )
+
+    dialog.bind(
+        "<MouseWheel>",
+        lambda event: canvas.yview_scroll(
+            -(event.delta // 120 or 1),
+            "units",
+        ),
+    )
+    dialog.bind(
+        "<Button-4>",
+        lambda event: canvas.yview_scroll(-1, "units"),
+    )
+    dialog.bind(
+        "<Button-5>",
+        lambda event: canvas.yview_scroll(1, "units"),
+    )
+
+    dialog.grab_set()
+    dialog.wait_window()
+
+    return result.get("value")
+
+
+def import_template(root, refresh_templates):
+    selected_path = filedialog.askopenfilename(
+        parent=root,
+        title="Выберите файл шаблона",
+        filetypes=[
+            ("Шаблоны Word", "*.docx"),
+            ("Все файлы", "*.*"),
+        ],
+    )
+
+    if not selected_path:
+        return
+
+    source_path = Path(selected_path)
+
+    if source_path.suffix.lower() != ".docx":
+        messagebox.showerror(
+            "Ошибка",
+            "Шаблон должен быть файлом .docx",
+            parent=root,
+        )
+        return
+
+    try:
+        placeholders = extract_placeholders(source_path)
+    except (OSError, zipfile.BadZipFile) as error:
+        messagebox.showerror(
+            "Не удалось прочитать шаблон",
+            str(error),
+            parent=root,
+        )
+        return
+
+    if not placeholders:
+        messagebox.showwarning(
+            "Плейсхолдеры не найдены",
+            "В шаблоне не найдено ни одного плейсхолдера "
+            "в формате {{ имя_поля }}.\n\n"
+            "Импорт отменён.",
+            parent=root,
+        )
+        return
+
+    labels = ask_template_labels(
+        root,
+        source_path.stem,
+        {placeholder: placeholder for placeholder in placeholders},
+    )
+
+    if labels is None:
+        return
+
+    new_title, field_labels = labels
+    template_dir = make_unique_template_dir(source_path.stem)
+
+    try:
+        template_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, template_dir / source_path.name)
+
+        config = {
+            "id": template_dir.name,
+            "title": new_title,
+            "file": source_path.name,
+            "fields": {
+                placeholder: {
+                    "label": field_labels[placeholder],
+                    "required": False,
+                    "type": (
+                        "date"
+                        if DATE_FIELD_PATTERN.search(placeholder)
+                        else "text"
+                    ),
+                }
+                for placeholder in placeholders
+            },
+            "config_path": template_dir / "config.yaml",
+        }
+        save_template_config(config)
+    except OSError as error:
+        shutil.rmtree(template_dir, ignore_errors=True)
+        messagebox.showerror(
+            "Не удалось импортировать шаблон",
+            str(error),
+            parent=root,
+        )
+        return
+
+    refresh_templates(new_title)
+    messagebox.showinfo(
+        "Шаблон импортирован",
+        f"Шаблон «{new_title}» добавлен,\n"
+        f"плейсхолдеров: {len(placeholders)}",
+        parent=root,
+    )
+
+
+def edit_template_labels(root, template_combobox, title_to_key, refresh_templates):
+    selection = template_combobox.get()
+
+    if selection not in title_to_key:
+        messagebox.showerror(
+            "Ошибка",
+            "Шаблон не выбран",
+            parent=root,
+        )
+        return
+
+    template_config = TEMPLATES[title_to_key[selection]]
+    fields = {
+        field_name: field_config.get("label", "")
+        for field_name, field_config in template_config["fields"].items()
+    }
+
+    try:
+        placeholders = extract_placeholders(template_config["file"])
+    except (OSError, zipfile.BadZipFile):
+        placeholders = []
+
+    for placeholder in placeholders:
+        if placeholder not in fields:
+            fields[placeholder] = placeholder
+
+    updated = ask_template_labels(root, template_config["title"], fields)
+
+    if updated is None:
+        return
+
+    new_title, field_labels = updated
+
+    template_config["title"] = new_title
+    fields_config = template_config["fields"]
+
+    for field_name, label in field_labels.items():
+        if field_name not in fields_config:
+            fields_config[field_name] = {
+                "label": label,
+                "required": False,
+                "type": (
+                    "date" if DATE_FIELD_PATTERN.search(field_name) else "text"
+                ),
+            }
+        else:
+            fields_config[field_name]["label"] = label
+
+    try:
+        save_template_config(template_config)
+    except OSError as error:
+        messagebox.showerror(
+            "Не удалось сохранить шаблон",
+            str(error),
+            parent=root,
+        )
+        return
+
+    refresh_templates(new_title)
+
+
+def delete_template(root, template_combobox, title_to_key, refresh_templates):
+    selection = template_combobox.get()
+
+    if selection not in title_to_key:
+        messagebox.showerror(
+            "Ошибка",
+            "Шаблон не выбран",
+            parent=root,
+        )
+        return
+
+    if len(TEMPLATES) <= 1:
+        messagebox.showerror(
+            "Нельзя удалить шаблон",
+            "В приложении должен остаться хотя бы один шаблон",
+            parent=root,
+        )
+        return
+
+    template_config = TEMPLATES[title_to_key[selection]]
+
+    confirmed = messagebox.askyesno(
+        "Удаление шаблона",
+        f"Удалить шаблон «{template_config['title']}» "
+        "вместе со всеми его файлами?",
+        parent=root,
+    )
+
+    if not confirmed:
+        return
+
+    template_dir = template_config["config_path"].parent
+
+    try:
+        shutil.rmtree(template_dir)
+    except OSError as error:
+        messagebox.showerror(
+            "Не удалось удалить шаблон",
+            str(error),
+            parent=root,
+        )
+        return
+
+    refresh_templates()
+
+
 def get_default_catalog_path():
     """Prefer the private catalog and fall back to the public example."""
 
@@ -432,7 +919,7 @@ def choose_catalog(
 def main():
     global TEMPLATES
 
-    TEMPLATES = load_templates(TEMPLATE_DIRS)
+    TEMPLATES = load_templates_with_fallback(TEMPLATE_DIRS)
 
     if not TEMPLATES:
         searched_paths = ", ".join(str(path) for path in TEMPLATE_DIRS)
@@ -476,9 +963,92 @@ def main():
     template_combobox.grid(row=0, column=0, columnspan=2, sticky="ew")
     template_combobox.current(0)
 
+    def refresh_templates(select_title=None):
+        global TEMPLATES
+
+        try:
+            updated_templates = load_templates_with_fallback(TEMPLATE_DIRS)
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "Не удалось обновить шаблоны",
+                str(error),
+                parent=root,
+            )
+            return
+
+        if not updated_templates:
+            messagebox.showerror(
+                "Не удалось обновить шаблоны",
+                "Шаблоны не найдены",
+                parent=root,
+            )
+            return
+
+        TEMPLATES = updated_templates
+        title_to_key.clear()
+        title_to_key.update(
+            {
+                template_config["title"]: template_key
+                for template_key, template_config in TEMPLATES.items()
+            }
+        )
+        template_combobox["values"] = list(title_to_key)
+
+        if select_title and select_title in title_to_key:
+            template_combobox.set(select_title)
+        elif template_combobox.get() not in title_to_key:
+            template_combobox.current(0)
+
+        change_template(
+            template_combobox,
+            title_to_key,
+            frame,
+            entries,
+            name_combobox,
+            data_dict,
+        )
+
+    template_actions = ttk.Frame(root)
+    template_actions.grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        padx=5,
+        pady=(0, 5),
+        sticky="w",
+    )
+
+    ttk.Button(
+        template_actions,
+        text="Импорт шаблона…",
+        command=lambda: import_template(root, refresh_templates),
+    ).pack(side="left", padx=(0, 5))
+
+    ttk.Button(
+        template_actions,
+        text="Изменить подписи…",
+        command=lambda: edit_template_labels(
+            root,
+            template_combobox,
+            title_to_key,
+            refresh_templates,
+        ),
+    ).pack(side="left", padx=(0, 5))
+
+    ttk.Button(
+        template_actions,
+        text="Удалить шаблон",
+        command=lambda: delete_template(
+            root,
+            template_combobox,
+            title_to_key,
+            refresh_templates,
+        ),
+    ).pack(side="left")
+
     catalog_frame = ttk.Frame(root)
     catalog_frame.grid(
-        row=1,
+        row=2,
         column=0,
         columnspan=2,
         padx=5,
@@ -533,10 +1103,10 @@ def main():
         padx=(8, 0),
     )
 
-    name_combobox.grid(row=2, column=0, columnspan=2, sticky="ew")
+    name_combobox.grid(row=3, column=0, columnspan=2, sticky="ew")
 
     frame = tk.Frame(root)
-    frame.grid(row=3, column=0, columnspan=2, sticky="ew")
+    frame.grid(row=4, column=0, columnspan=2, sticky="ew")
     frame.columnconfigure(1, weight=1)
 
     render_frame(template_combobox, title_to_key, frame, entries)
@@ -562,7 +1132,7 @@ def main():
     submit_button = tk.Button(root, text='Сгенерировать', 
                               command=lambda: handle_button_click(
                                   entries, selected_template, title_to_key))
-    submit_button.grid(row=4, 
+    submit_button.grid(row=5,
                        column=0,
                        columnspan=2,
                        pady=10,
