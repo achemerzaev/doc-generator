@@ -111,12 +111,13 @@ TEMPLATES = {}
 
 
 def make_output_filename(context, template_name):
-    splitted_name = context["employee_full_name"].split()
-    output_name = template_name + "_"
-    for x in splitted_name:
-        output_name = output_name + x + "_"
-    output_name = output_name + "2026.docx"
-    return output_name
+    record_name = context.get("employee_full_name") or next(
+        (value for value in context.values() if value), ""
+    )
+    parts = [template_name, str(record_name), str(date.today().year)]
+    output_name = "_".join("_".join(part.split()) for part in parts if part)
+    output_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", output_name)
+    return output_name + ".docx"
 
 
 def doc_render(template_path, template_name, context, output_path):
@@ -214,7 +215,7 @@ def render_frame(template_combobox, title_to_key, frame, entries):
 
 def fill_frame(name_combobox, data_dict, entries):
     selection = name_combobox.get().strip()
-    employee_data = data_dict.get(selection, {})
+    record_data = data_dict.get(selection, {})
 
     today = date.today()
     try:
@@ -239,44 +240,20 @@ def fill_frame(name_combobox, data_dict, entries):
             entry.insert(0, str(value))
 
     
-    # ФИО записываем независимо от того,
-    # есть ли человек в Excel
-    set_entry_value(
-        "employee_full_name",
-        selection,
-    )
+    # Defaults apply only when the corresponding column is absent in Excel.
+    values = {
+        "employee_full_name": selection if selection not in data_dict else "",
+        "begin_date": today.strftime("%d.%m.%Y"),
+        "end_date": future_date.strftime("%d.%m.%Y"),
+    }
+    values.update(record_data)
 
-    # Начальная дата — сегодня.
-    set_entry_value(
-        "begin_date",
-        today.strftime("%d.%m.%Y"),
-    )
-
-    # Конечная дата — через два года.
-    set_entry_value(
-        "end_date",
-        future_date.strftime("%d.%m.%Y"),
-    )
-
-    # Дату приказа специально не заполняем.
-    # Поле order_date останется пустым.
-
-    # Подставляем остальные сведения из Excel.
-    for field_name, value in employee_data.items():
-        # Эти значения уже установлены выше и не должны
-        # случайно перезаписываться данными из таблицы.
-        if field_name in {
-            "employee_full_name",
-            "begin_date",
-            "end_date",
-            "order_date",
-        }:
-            continue
-
-        set_entry_value(
-            field_name,
-            value,
-        )
+    # Clear fields missing from this record so previous values cannot leak.
+    for field_name in entries:
+        value = values.get(field_name, "")
+        if isinstance(value, date):
+            value = value.strftime("%d.%m.%Y")
+        set_entry_value(field_name, value)
 
 
 def change_template(
@@ -385,7 +362,7 @@ def save_template_config(config):
 
 
 def make_unique_template_dir(base_name):
-    templates_root = APP_DIR / "templates"
+    templates_root = BUNDLE_DIR / "templates"
     templates_root.mkdir(parents=True, exist_ok=True)
 
     slug = re.sub(r"[^0-9A-Za-z_]+", "_", base_name).strip("_").lower()
@@ -818,36 +795,50 @@ def read_catalog(catalog_file):
         ) from error
 
     try:
-        sheet = workbook.active
+        sheet = workbook.worksheets[0]
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
         headers = [
-            str(cell.value).strip() if cell.value is not None else ""
-            for cell in sheet[1]
+            str(value).strip() if value is not None else ""
+            for value in header_row
         ]
 
-        if not headers or headers[0] != "employee_full_name":
-            raise ValueError(
-                "первый столбец каталога должен называться "
-                "employee_full_name"
-            )
-
-        if any(not header for header in headers):
+        if not headers or any(not header for header in headers):
             raise ValueError("названия столбцов каталога не могут быть пустыми")
 
         if len(headers) != len(set(headers)):
             raise ValueError("названия столбцов каталога не должны повторяться")
 
+        # Keep the familiar employee selector for existing catalogs, but accept
+        # any schema. All columns, including the selector, are template values.
+        selector_index = (
+            headers.index("employee_full_name")
+            if "employee_full_name" in headers
+            else 0
+        )
+        records = []
+
+        for row_number, row in enumerate(
+            sheet.iter_rows(min_row=2, values_only=True), start=2
+        ):
+            if all(value is None or value == "" for value in row):
+                continue
+
+            value = row[selector_index]
+            label = str(value).strip() if value is not None else ""
+            records.append((label, row_number, dict(zip(headers, row))))
+
+        label_counts = {}
+        for label, _, _ in records:
+            label_counts[label] = label_counts.get(label, 0) + 1
+
         data_dict = {}
-
-        for row in sheet.iter_rows(min_row=2, values_only=True):
-            if not row or row[0] is None:
-                continue
-
-            full_name = str(row[0]).strip()
-
-            if not full_name:
-                continue
-
-            data_dict[full_name] = dict(zip(headers[1:], row[1:]))
+        reserved_labels = {label for label, _, _ in records if label}
+        for label, row_number, record in records:
+            if not label or label_counts[label] > 1:
+                label = f"{label or 'Запись'} (строка {row_number})"
+                while label in reserved_labels or label in data_dict:
+                    label += "_"
+            data_dict[label] = record
 
         return data_dict
     finally:
@@ -879,7 +870,7 @@ def choose_catalog(
 
     selected_path = filedialog.askopenfilename(
         parent=root,
-        title="Выберите каталог сотрудников",
+        title="Выберите Excel с данными",
         initialdir=initial_dir,
         filetypes=[
             ("Книги Excel", "*.xlsx"),
@@ -1059,7 +1050,7 @@ def main():
 
     ttk.Label(
         catalog_frame,
-        text="Каталог сотрудников:",
+        text="Данные Excel:",
     ).grid(
         row=0,
         column=0,
