@@ -101,6 +101,7 @@ CATALOG_DIRS = unique_paths(
 
 CATALOG_DIR = APP_DIR / "catalog"
 OUTPUT_DIR = APP_DIR / "output"
+SETTINGS_PATH = APP_DIR / "settings.yaml"
 PRIVATE_CATALOG_PATH = CATALOG_DIR / "catalog.xlsx"
 EXAMPLE_CATALOG_PATHS = tuple(
     catalog_dir / "example_catalog.xlsx"
@@ -110,17 +111,54 @@ EXAMPLE_CATALOG_PATHS = tuple(
 TEMPLATES = {}
 
 
+def load_settings():
+    try:
+        settings = yaml.safe_load(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return settings if isinstance(settings, dict) else {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def save_settings(settings):
+    SETTINGS_PATH.write_text(
+        yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8"
+    )
+
+
+def sanitize_output_filename(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(". ")
+    if name.lower().endswith(".docx"):
+        name = name[:-5].rstrip(". ")
+    if not name:
+        raise ValueError("Введите название выходного файла")
+    if re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name):
+        name = "_" + name
+    return name + ".docx"
+
+
 def make_output_filename(context, template_name):
     record_name = context.get("employee_full_name") or next(
         (value for value in context.values() if value), ""
     )
-    parts = [template_name, str(record_name), str(date.today().year)]
-    output_name = "_".join("_".join(part.split()) for part in parts if part)
-    output_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", output_name)
-    return output_name + ".docx"
+    template_name = re.sub(r"\bшаблон\b", "", template_name.replace("_", " "), flags=re.I)
+    # Employee names in the catalog normally include a patronymic.
+    record_name = " ".join(str(record_name).split()[:2])
+    parts = [template_name, record_name, str(date.today().year)]
+    return sanitize_output_filename(" ".join(" ".join(part.split()) for part in parts if part))
 
 
-def doc_render(template_path, template_name, context, output_path):
+def suggest_output_name(selection, records, template_name):
+    """Suggest a filename only for a selected catalog record."""
+    record = records.get(selection)
+    if record is None:
+        return ""
+    full_name = record.get("employee_full_name", next(iter(record.values()), ""))
+    if not full_name or not str(full_name).strip():
+        return ""
+    return make_output_filename({"employee_full_name": full_name}, template_name)[:-5]
+
+
+def doc_render(template_path, template_name, context, output_path, output_name=None):
     if not template_path.is_file():
         raise FileNotFoundError(f"шаблон не найден: {template_path}")
 
@@ -130,7 +168,11 @@ def doc_render(template_path, template_name, context, output_path):
 
     doc = DocxTemplate(template_path)
     doc.render(context)
-    output_name = make_output_filename(context, template_name)
+    output_name = (
+        sanitize_output_filename(output_name)
+        if output_name is not None
+        else make_output_filename(context, template_name)
+    )
     output_filename = output_path / output_name
 
     output_filename.parent.mkdir(parents = True, exist_ok = True)
@@ -146,7 +188,7 @@ def validate(context, fields_config):
             raise ValueError(f"обязательное поле {field_config['label']} не заполнено")
 
 
-def handle_button_click(entries, selected_template, title_to_key):
+def handle_button_click(entries, selected_template, title_to_key, output_name=None):
     selected_title = selected_template.get()
     template_key = title_to_key[selected_title]
     template_config = TEMPLATES[template_key]
@@ -159,18 +201,19 @@ def handle_button_click(entries, selected_template, title_to_key):
     context = {}
 
     try:
+        sanitize_output_filename(output_name or "")
         for entry in entries:
             context[entry] = entries[entry].get().strip()
 
         validate(context, fields_config)
-        out = doc_render(template_path, template_name, context, output_path)
+        out = doc_render(template_path, template_name, context, output_path, output_name)
 
     except ValueError as error:
-        messagebox.showerror("Ошибка e", f"ошибка e {error}")
+        messagebox.showerror("Ошибка", str(error))
     except FileNotFoundError as error:
-        messagebox.showerror("Ошибка", f"ошибка df {error}")
+        messagebox.showerror("Ошибка", str(error))
     except Exception as e:
-        messagebox.showerror("Ошибка", f"ошибка sew {e}")
+        messagebox.showerror("Ошибка", str(e))
     else:
         messagebox.showinfo("Документ создан", f"Путь: {out}")
 
@@ -213,8 +256,10 @@ def render_frame(template_combobox, title_to_key, frame, entries):
 
         entries[field_name] = entry
 
+    fill_frame(None, {}, entries)
+
 def fill_frame(name_combobox, data_dict, entries):
-    selection = name_combobox.get().strip()
+    selection = name_combobox.get().strip() if name_combobox else ""
     record_data = data_dict.get(selection, {})
 
     today = date.today()
@@ -240,13 +285,15 @@ def fill_frame(name_combobox, data_dict, entries):
             entry.insert(0, str(value))
 
     
-    # Defaults apply only when the corresponding column is absent in Excel.
+    # Catalog values override defaults; a blank start date defaults to today.
     values = {
         "employee_full_name": selection if selection not in data_dict else "",
         "begin_date": today.strftime("%d.%m.%Y"),
         "end_date": future_date.strftime("%d.%m.%Y"),
     }
     values.update(record_data)
+    if not values.get("begin_date"):
+        values["begin_date"] = today.strftime("%d.%m.%Y")
 
     # Clear fields missing from this record so previous values cannot leak.
     for field_name in entries:
@@ -263,6 +310,7 @@ def change_template(
     entries,
     name_combobox,
     data_dict,
+    on_change=None,
 ):
     # Сначала создаём поля нового шаблона
     render_frame(
@@ -280,6 +328,8 @@ def change_template(
             data_dict,
             entries,
         )
+    if on_change:
+        on_change()
 
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
@@ -442,6 +492,28 @@ def load_templates_with_fallback(template_dirs):
         pass
 
     return load_templates(template_dirs)
+
+
+def refresh_template_files(templates):
+    """Reload imported DOCX copies and reconcile fields, preserving labels."""
+    for config in templates.values():
+        source = config.get("source_path")
+        if source and Path(source).is_file():
+            if Path(source).resolve() != config["file"].resolve():
+                # Validate before replacing the working copy.
+                extract_placeholders(Path(source))
+                shutil.copy2(source, config["file"])
+        placeholders = extract_placeholders(config["file"])
+        old_fields = config["fields"]
+        config["fields"] = {
+            name: old_fields.get(name, {
+                "label": name,
+                "required": False,
+                "type": "date" if DATE_FIELD_PATTERN.search(name) else "text",
+            })
+            for name in placeholders
+        }
+        save_template_config(config)
 
 
 def ask_template_labels(root, title, fields):
@@ -621,6 +693,7 @@ def import_template(root, refresh_templates):
             "id": template_dir.name,
             "title": new_title,
             "file": source_path.name,
+            "source_path": str(source_path.resolve()),
             "fields": {
                 placeholder: {
                     "label": field_labels[placeholder],
@@ -764,7 +837,9 @@ def delete_template(root, template_combobox, title_to_key, refresh_templates):
 def get_default_catalog_path():
     """Prefer the private catalog and fall back to the public example."""
 
+    saved_catalog = load_settings().get("catalog_path")
     for catalog_path in (
+        *((Path(saved_catalog),) if isinstance(saved_catalog, str) and saved_catalog else ()),
         PRIVATE_CATALOG_PATH,
         *EXAMPLE_CATALOG_PATHS,
     ):
@@ -896,8 +971,7 @@ def choose_catalog(
     name_combobox.set_values(data_dict.keys())
     name_combobox.clear()
 
-    for entry in entries.values():
-        entry.delete(0, tk.END)
+    fill_frame(None, {}, entries)
 
     catalog_path_var.set(str(Path(selected_path)))
     messagebox.showinfo(
@@ -921,9 +995,10 @@ def main():
     root = tk.Tk()
 
     root.title("Генератор заявок")
-    root.geometry("800x600")
+    root.geometry("900x750")
     root.columnconfigure(0, weight=1)
     entries = {}
+    settings = load_settings()
 
     default_catalog_path = get_default_catalog_path()
     startup_catalog_error = None
@@ -953,13 +1028,39 @@ def main():
 
     template_combobox.grid(row=0, column=0, columnspan=2, sticky="ew")
     template_combobox.current(0)
+    default_template = settings.get("template_id")
+    if isinstance(default_template, str) and default_template in TEMPLATES:
+        template_combobox.set(TEMPLATES[default_template]["title"])
+
+    output_name_var = tk.StringVar(root)
+    last_output_name = ""
+    selected_catalog_label = None
+
+    def update_output_name(force=False):
+        nonlocal last_output_name
+        suggested = suggest_output_name(
+            selected_catalog_label, data_dict, template_combobox.get()
+        )
+        if force or output_name_var.get() in ("", last_output_name):
+            output_name_var.set(suggested)
+        last_output_name = suggested
+
+    def set_default(key, value):
+        updated = dict(settings, **{key: value})
+        try:
+            save_settings(updated)
+        except OSError as error:
+            messagebox.showerror("Не удалось сохранить настройки", str(error), parent=root)
+            return
+        settings.update(updated)
+        messagebox.showinfo("Настройки сохранены", "Выбор сохранён по умолчанию", parent=root)
 
     def refresh_templates(select_title=None):
         global TEMPLATES
 
         try:
             updated_templates = load_templates_with_fallback(TEMPLATE_DIRS)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, yaml.YAMLError) as error:
             messagebox.showerror(
                 "Не удалось обновить шаблоны",
                 str(error),
@@ -997,7 +1098,21 @@ def main():
             entries,
             name_combobox,
             data_dict,
+            update_output_name,
         )
+
+    def refresh_information():
+        try:
+            refresh_template_files(load_templates(TEMPLATE_DIRS))
+            current_catalog = catalog_path_var.get()
+            if current_catalog:
+                updated_data = read_catalog(current_catalog)
+                data_dict.clear()
+                data_dict.update(updated_data)
+                name_combobox.set_values(data_dict.keys())
+            refresh_templates(template_combobox.get())
+        except (OSError, ValueError, yaml.YAMLError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Не удалось обновить информацию", str(error), parent=root)
 
     template_actions = ttk.Frame(root)
     template_actions.grid(
@@ -1035,6 +1150,17 @@ def main():
             title_to_key,
             refresh_templates,
         ),
+    ).pack(side="left")
+
+    ttk.Button(
+        template_actions,
+        text="По умолчанию",
+        command=lambda: set_default("template_id", title_to_key[template_combobox.get()]),
+    ).pack(side="left", padx=5)
+    ttk.Button(
+        template_actions,
+        text="Обновить информацию",
+        command=refresh_information,
     ).pack(side="left")
 
     catalog_frame = ttk.Frame(root)
@@ -1078,6 +1204,14 @@ def main():
         max_visible_rows=6,
     )
 
+    def employee_input_changed(*_):
+        nonlocal selected_catalog_label
+        if name_combobox.get().strip() != selected_catalog_label:
+            selected_catalog_label = None
+            update_output_name()
+
+    name_combobox.variable.trace_add("write", employee_input_changed)
+
     ttk.Button(
         catalog_frame,
         text="Выбрать…",
@@ -1094,6 +1228,12 @@ def main():
         padx=(8, 0),
     )
 
+    ttk.Button(
+        catalog_frame,
+        text="По умолчанию",
+        command=lambda: set_default("catalog_path", catalog_path_var.get()),
+    ).grid(row=0, column=3, padx=(8, 0))
+
     name_combobox.grid(row=3, column=0, columnspan=2, sticky="ew")
 
     frame = tk.Frame(root)
@@ -1101,6 +1241,7 @@ def main():
     frame.columnconfigure(1, weight=1)
 
     render_frame(template_combobox, title_to_key, frame, entries)
+    update_output_name()
 
     template_combobox.bind("<<ComboboxSelected>>", 
     lambda event: change_template(
@@ -1110,20 +1251,31 @@ def main():
         entries,
         name_combobox,
         data_dict,
+        update_output_name,
         ),
     )
 
-    name_combobox.bind("<<SearchableComboboxSelected>>", 
-    lambda event: fill_frame(
-        name_combobox, 
-        data_dict,
-        entries
-    ))
+    def select_employee(_event):
+        nonlocal selected_catalog_label
+        selection = name_combobox.get().strip()
+        selected_catalog_label = selection if selection in data_dict else None
+        fill_frame(name_combobox, data_dict, entries)
+        update_output_name(force=selected_catalog_label is not None)
+
+    name_combobox.bind("<<SearchableComboboxSelected>>", select_employee)
+
+    output_frame = ttk.Frame(root)
+    output_frame.grid(row=5, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+    output_frame.columnconfigure(1, weight=1)
+    ttk.Label(output_frame, text="Название выходного файла *:").grid(row=0, column=0, padx=(0, 8))
+    ttk.Entry(output_frame, textvariable=output_name_var).grid(row=0, column=1, sticky="ew")
+    ttk.Label(output_frame, text="Обязательное поле. Укажите название без расширения файла (.docx).",
+              ).grid(row=1, column=1, sticky="w", pady=(3, 0))
 
     submit_button = tk.Button(root, text='Сгенерировать', 
                               command=lambda: handle_button_click(
-                                  entries, selected_template, title_to_key))
-    submit_button.grid(row=5,
+                                  entries, selected_template, title_to_key, output_name_var.get()))
+    submit_button.grid(row=6,
                        column=0,
                        columnspan=2,
                        pady=10,

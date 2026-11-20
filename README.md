@@ -37,19 +37,53 @@ be selected. The selection column also fills its matching placeholder.
 
 Only columns matching template fields are used. Missing fields remain empty
 and can be entered manually. For existing templates, `begin_date` defaults to
-today and `end_date` to two years from today only if those columns are absent.
-Excel values, including empty cells, override these defaults; Excel dates
+today and `end_date` to two years from today when the form opens.
+Excel values override these defaults, except that a blank `begin_date` also
+defaults to today. A blank `end_date` stays empty. Excel dates
 are formatted as `DD.MM.YYYY`. Switching rows clears previous field values.
 Templates without `employee_full_name` can also generate documents.
+
+The editable **Название выходного файла** field suggests a name such as
+`УЗ создание Иванов Иван 2026`: template title without the word `шаблон`,
+the first two parts of the selected catalog record's `employee_full_name`, and
+the current year. Selecting another employee replaces the suggestion. Manual
+form entry does not generate a filename: enter it yourself in the required
+filename field, without an extension. The `.docx` extension is added automatically.
+
+Use **По умолчанию** beside the template or Excel catalog to remember that
+choice for the next launch. Preferences are saved in `settings.yaml` beside
+the executable (or source file). If a saved resource disappears, the app
+falls back to an available template or catalog.
+
+**Обновить информацию** reloads the current Excel catalog and template files,
+including added or removed placeholders. Existing field labels are preserved.
+Newly imported templates remember their source DOCX path; refresh copies
+changes from that file when it is available. For templates imported by older
+versions, edit the application's stored DOCX or import the template again.
+Refresh rebuilds the form from the selected catalog record, so manually
+entered field values should be saved in a document first.
 
 Personal workbooks placed in `catalog/` are ignored by Git. Only
 `example_catalog.xlsx`, which contains fictitious data, is committed.
 
 ## Running a packaged build
 
+The build includes `INSTRUCTION.txt` beside the executable: an offline Russian
+guide for nontechnical users covering startup, Word templates, Excel employee
+catalogs, generated documents, backups, and troubleshooting. Its source is
+[INSTRUCTION.txt](./INSTRUCTION.txt). Every PyInstaller build appends the actual
+Python and dependency versions, build platform, timestamp, and Git revision
+for future vulnerability checks. The broader build-environment package list
+is labelled separately from the application dependencies.
+
 Keep the `DocGenerator` executable and the `_internal` directory together.
 The `_internal` directory contains the Python runtime and the bundled public
 example files; it is a normal part of a PyInstaller build.
+The build includes only Russian and English Babel locales and Tcl/Tk message
+translations; runtime encodings and timezone resources are retained.
+Test files, test runners (`unittest`, `doctest`, `pytest`) and the standard-library
+test suite are excluded from production builds. Jinja2's `tests` module is kept
+because it implements template conditions such as `is defined`.
 
 Imported templates are saved in `_internal/templates/`, alongside the bundled
 example template. Previously added templates in `templates/` beside the

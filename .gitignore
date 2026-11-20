@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.ruff_cache/
+build/
+dist/
+settings.yaml
+DocGenerator-error.log
+output/
+catalog/*.xlsx
+!catalog/example_catalog.xlsx
