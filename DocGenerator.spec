@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+import runpy
 
 analysis = Analysis(
     ["main.py"],
@@ -13,7 +15,12 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Test runners and the standard-library test suite are not runtime
+    # dependencies. jinja2.tests implements template expressions and stays.
+    excludes=[
+        "unittest", "doctest", "pytest", "test", "tests", "tkinter.test",
+        "test_catalog", "test_preferences",
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -24,13 +31,28 @@ required_babel_locales = {
     "root.dat",
     "ru.dat",
     "ru_RU.dat",
+    "en.dat",
+    "en_US.dat",
+    "en_US_POSIX.dat",
 }
+
+
+def keep_locale_resource(destination):
+    destination = destination.replace("\\", "/")
+    if destination.startswith("babel/locale-data/"):
+        return destination.rsplit("/", 1)[-1] in required_babel_locales
+    # Tcl/Tk ship translated messages independently of Babel. Encodings and
+    # timezone data are runtime resources and must remain intact.
+    if "/msgs/" in destination and destination.endswith(".msg"):
+        language = destination.rsplit("/", 1)[-1].split(".")[0].split("_")[0]
+        return language in {"ru", "en"}
+    return True
+
+
 analysis.datas = [
     entry
     for entry in analysis.datas
-    if not entry[0].replace("\\", "/").startswith("babel/locale-data/")
-    or entry[0].replace("\\", "/").rsplit("/", 1)[-1]
-    in required_babel_locales
+    if keep_locale_resource(entry[0])
 ]
 
 python_archive = PYZ(analysis.pure)
@@ -61,4 +83,10 @@ distribution = COLLECT(
     upx=True,
     upx_exclude=[],
     name="DocGenerator",
+)
+
+# Keep the guide visible beside the executable on both Windows and Linux.
+# Generate it from this build environment so library versions cannot go stale.
+runpy.run_path(str(Path(SPECPATH) / "build_instructions.py"))["write_instructions"](
+    Path(DISTPATH) / "DocGenerator", source_dir=SPECPATH,
 )

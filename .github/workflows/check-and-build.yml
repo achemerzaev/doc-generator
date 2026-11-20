@@ -40,8 +40,8 @@ jobs:
 
       - name: Check Python files
         run: |
-          python -m compileall -q main.py widgets.py
-          ruff check main.py widgets.py --select E9,F63,F7,F82
+          python -m compileall -q main.py widgets.py build_instructions.py
+          ruff check main.py widgets.py build_instructions.py --select E9,F63,F7,F82
           python -m unittest discover -v
 
   build:
